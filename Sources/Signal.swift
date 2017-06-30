@@ -1959,92 +1959,159 @@ private enum ThrottleWhileState<Value> {
 	}
 }
 
-private protocol SignalAggregateStrategy {
+private protocol SignalAggregateStrategy: class {
 	/// Update the latest value of the signal at `position` to be `value`.
 	///
 	/// - parameters:
 	///   - value: The latest value emitted by the signal at `position`.
 	///   - position: The position of the signal.
-	///
-	/// - returns: `true` if the aggregating signal should terminate as a result of the
-	///            update. `false` otherwise.
-	mutating func update(_ value: Any, at position: Int) -> Bool
+	func update(_ value: Any, at position: Int)
 
 	/// Record the completion of the signal at `position`.
 	///
 	/// - parameters:
 	///   - position: The position of the signal.
-	///
-	/// - returns: `true` if the aggregating signal should terminate as a result of the
-	///            completion. `false` otherwise.
-	mutating func complete(at position: Int) -> Bool
+	func complete(at position: Int)
 
-	init(count: Int, action: @escaping (ContiguousArray<Any>) -> Void)
+	init(count: Int, action: @escaping (AggregateStrategyEvent) -> Void)
+}
+
+private enum AggregateStrategyEvent {
+	case value(ContiguousArray<Any>)
+	case completed
 }
 
 extension Signal {
-	private struct CombineLatestStrategy: SignalAggregateStrategy {
+	// Threading of `CombineLatestStrategy` and `ZipStrategy`.
+	//
+	// The threading model of these strategies mirror that of `Signal.Core` to allow
+	// recursive termial event sent by a `value` event. Specifically, completion status
+	// is tracked separately with its own lock to permit recursive completion, even if the
+	// event delivery lock is still acquired.
+
+	private final class CombineLatestStrategy: SignalAggregateStrategy {
 		private enum Placeholder {
 			case none
 		}
 
-		private var values: ContiguousArray<Any>
-		private var completionCount: Int
-		private let action: (ContiguousArray<Any>) -> Void
+		private struct Storage {
+			var values: ContiguousArray<Any>
 
-		private var _haveAllSentInitial: Bool
-		private var haveAllSentInitial: Bool {
-			mutating get {
-				if _haveAllSentInitial {
-					return true
+			private var _haveAllSentInitial: Bool
+			var haveAllSentInitial: Bool {
+				mutating get {
+					if _haveAllSentInitial {
+						return true
+					}
+
+					_haveAllSentInitial = values.reduce(true) { $0 && !($1 is Placeholder) }
+					return _haveAllSentInitial
+				}
+			}
+
+			init(count: Int) {
+				values = ContiguousArray(repeating: Placeholder.none, count: count)
+				_haveAllSentInitial = false
+			}
+		}
+
+		private let count: Int
+		private let lock: Lock
+		private var storage: Storage
+
+		/// The completion tracker of the aggregator, or `nil` if the aggregator has
+		/// completed.
+		private let completion: Atomic<Int?>
+		private let action: (AggregateStrategyEvent) -> Void
+
+		func update(_ value: Any, at position: Int) {
+			lock.lock()
+			storage.values[position] = value
+
+			if storage.haveAllSentInitial {
+				action(.value(storage.values))
+			}
+
+			lock.unlock()
+
+			if let count = completion.value, count == self.count {
+				tryToCommitCompletion()
+			}
+		}
+
+		func complete(at position: Int) {
+			completion.modify { completionCount in
+				guard let count = completionCount else {
+					fatalError("Overcompletion.")
 				}
 
-				_haveAllSentInitial = values.reduce(true) { $0 && !($1 is Placeholder) }
-				return _haveAllSentInitial
+				completionCount = count + 1
+			}
+
+			if lock.try() {
+				tryToCommitCompletion()
+				lock.unlock()
 			}
 		}
 
-		mutating func update(_ value: Any, at position: Int) -> Bool {
-			values[position] = value
-
-			if haveAllSentInitial {
-				action(values)
+		private func tryToCommitCompletion() {
+			let shouldComplete: Bool = completion.modify { completionCount in
+				if let count = completionCount, count == self.count {
+					completionCount = nil
+					return true
+				}
+				return false
 			}
 
-			return false
+			if shouldComplete {
+				action(.completed)
+			}
 		}
 
-		mutating func complete(at position: Int) -> Bool {
-			completionCount += 1
-			return completionCount == values.count
-		}
-
-		init(count: Int, action: @escaping (ContiguousArray<Any>) -> Void) {
-			values = ContiguousArray(repeating: Placeholder.none, count: count)
-			completionCount = 0
-			_haveAllSentInitial = false
+		init(count: Int, action: @escaping (AggregateStrategyEvent) -> Void) {
+			self.count = count
+			self.lock = Lock.make()
+			self.storage = Storage(count: count)
+			self.completion = Atomic(0)
 			self.action = action
 		}
 	}
 
-	private struct ZipStrategy: SignalAggregateStrategy {
-		private var values: ContiguousArray<[Any]>
-		private var isCompleted: ContiguousArray<Bool>
-		private let action: (ContiguousArray<Any>) -> Void
+	private final class ZipStrategy: SignalAggregateStrategy {
+		private struct CompletionStatus {
+			private var storage: ContiguousArray<Bool>
 
-		private var hasCompletedAndEmptiedSignal: Bool {
-			return Swift.zip(values, isCompleted).contains(where: { $0.0.isEmpty && $0.1 })
+			init(count: Int) {
+				storage = ContiguousArray(repeating: false, count: count)
+			}
+
+			mutating func setCompleted(at position: Int) {
+				storage[position] = true
+			}
+
+			func hasCompletedAndEmptiedSignal(with values: ContiguousArray<[Any]>) -> Bool {
+				return Swift.zip(values, storage).contains(where: { $0.0.isEmpty && $0.1 })
+			}
+
+			var areAllCompleted: Bool {
+				return storage.reduce(true) { $0 && $1 }
+			}
 		}
 
+		private let lock: Lock
+		private var values: ContiguousArray<[Any]>
 		private var canEmit: Bool {
 			return values.reduce(true) { $0 && !$1.isEmpty }
 		}
 
-		private var areAllCompleted: Bool {
-			return isCompleted.reduce(true) { $0 && $1 }
-		}
+		/// The completion tracker of the aggregator, or `nil` if the aggregator has
+		/// completed.
+		private var completion: Atomic<CompletionStatus?>
+		private let action: (AggregateStrategyEvent) -> Void
 
-		mutating func update(_ value: Any, at position: Int) -> Bool {
+
+		func update(_ value: Any, at position: Int) {
+			lock.lock()
 			values[position].append(value)
 
 			if canEmit {
@@ -2055,33 +2122,56 @@ extension Signal {
 					buffer.append(values[index].removeFirst())
 				}
 
-				action(buffer)
-
-				if hasCompletedAndEmptiedSignal {
-					return true
-				}
+				action(.value(buffer))
 			}
 
-			return false
+			lock.unlock()
+
+			if let status = completion.value,
+			   status.areAllCompleted || status.hasCompletedAndEmptiedSignal(with: values),
+			   lock.try() {
+				tryToCommitCompletion()
+				lock.unlock()
+			}
 		}
 
-		mutating func complete(at position: Int) -> Bool {
-			isCompleted[position] = true
+		func complete(at position: Int) {
+			completion.modify { status in
+				status?.setCompleted(at: position)
+			}
 
-			// `zip` completes when all signals has completed, or any of the signals
-			// has completed without any buffered value.
-			return hasCompletedAndEmptiedSignal || areAllCompleted
+			if lock.try() {
+				tryToCommitCompletion()
+				lock.unlock()
+			}
 		}
 
-		init(count: Int, action: @escaping (ContiguousArray<Any>) -> Void) {
-			values = ContiguousArray(repeating: [], count: count)
-			isCompleted = ContiguousArray(repeating: false, count: count)
+		private func tryToCommitCompletion() {
+			let shouldComplete: Bool = completion.modify { completionStatus in
+				// `zip` completes when all signals has completed, or any of the signals
+				// has completed without any buffered value.
+				if let status = completionStatus, status.hasCompletedAndEmptiedSignal(with: values) || status.areAllCompleted {
+					completionStatus = nil
+					return true
+				}
+				return false
+			}
+
+			if shouldComplete {
+				action(.completed)
+			}
+		}
+
+		init(count: Int, action: @escaping (AggregateStrategyEvent) -> Void) {
+			self.values = ContiguousArray(repeating: [], count: count)
+			self.completion = Atomic(CompletionStatus(count: count))
 			self.action = action
+			self.lock = Lock.make()
 		}
 	}
 
 	private final class AggregateBuilder<Strategy: SignalAggregateStrategy> {
-		fileprivate var startHandlers: [(_ index: Int, _ strategy: Atomic<Strategy>, _ action: @escaping (Signal<Never, Error>.Event) -> Void) -> Disposable?]
+		fileprivate var startHandlers: [(_ index: Int, _ strategy: Strategy, _ action: @escaping (Signal<Never, Error>.Event) -> Void) -> Disposable?]
 
 		init() {
 			self.startHandlers = []
@@ -2093,22 +2183,10 @@ extension Signal {
 				return signal.observe { event in
 					switch event {
 					case let .value(value):
-						let shouldComplete = strategy.modify {
-							return $0.update(value, at: index)
-						}
-
-						if shouldComplete {
-							action(.completed)
-						}
+						strategy.update(value, at: index)
 
 					case .completed:
-						let shouldComplete = strategy.modify {
-							return $0.complete(at: index)
-						}
-
-						if shouldComplete {
-							action(.completed)
-						}
+						strategy.complete(at: index)
 
 					case .interrupted:
 						action(.interrupted)
@@ -2126,7 +2204,14 @@ extension Signal {
 	private convenience init<Strategy: SignalAggregateStrategy>(_ builder: AggregateBuilder<Strategy>, _ transform: @escaping (ContiguousArray<Any>) -> Value) {
 		self.init { observer in
 			let disposables = CompositeDisposable()
-			let strategy = Atomic(Strategy(count: builder.startHandlers.count) { observer.send(value: transform($0)) })
+			let strategy = Strategy(count: builder.startHandlers.count) { event in
+				switch event {
+				case let .value(value):
+					observer.send(value: transform(value))
+				case .completed:
+					observer.sendCompleted()
+				}
+			}
 
 			for (index, action) in builder.startHandlers.enumerated() where !disposables.isDisposed {
 				disposables += action(index, strategy) { observer.action($0.map { _ in fatalError() }) }
